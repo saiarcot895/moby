@@ -41,6 +41,7 @@ import "C"
 import (
 	"fmt"
 	"math"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -48,11 +49,15 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/docker/docker/daemon/graphdriver"
+	"github.com/docker/docker/pkg/archive"
+	"github.com/docker/docker/pkg/chrootarchive"
 	"github.com/docker/docker/pkg/containerfs"
+	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/parsers"
 	units "github.com/docker/go-units"
@@ -129,7 +134,7 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		}
 	}
 
-	return graphdriver.NewNaiveDiffDriver(driver, driver.idMap), nil
+	return driver, nil
 }
 
 func parseOptions(opt []string) (btrfsOptions, bool, error) {
@@ -556,6 +561,53 @@ func subvolDelete(dirpath, name string, subvolID C.__u64, quotaEnabled bool) err
 	return nil
 }
 
+func subvolGetPropRO(path string) (bool, error) {
+	dir, err := openDir(path)
+	if err != nil {
+		return false, err
+	}
+	defer closeDir(dir)
+
+	var flags C.__u64
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_SUBVOL_GETFLAGS,
+		uintptr(unsafe.Pointer(&flags)))
+	if errno != 0 {
+		return false, fmt.Errorf("Failed to get btrfs subvolume flags for %s: %v", path, errno.Error())
+	}
+
+	return (flags & C.BTRFS_SUBVOL_RDONLY) != 0, nil
+}
+
+func subvolSetPropRO(path string, isReadOnly bool) error {
+	dir, err := openDir(path)
+	if err != nil {
+		return err
+	}
+	defer closeDir(dir)
+
+	var oldFlags, newFlags C.__u64
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_SUBVOL_GETFLAGS,
+		uintptr(unsafe.Pointer(&oldFlags)))
+	if errno != 0 {
+		return fmt.Errorf("Failed to get btrfs subvolume flags for %s: %v", path, errno.Error())
+	}
+
+	if isReadOnly {
+		newFlags = oldFlags | C.BTRFS_SUBVOL_RDONLY
+	} else {
+		newFlags = oldFlags &^ C.BTRFS_SUBVOL_RDONLY
+	}
+
+	if newFlags != oldFlags {
+		_, _, errno = unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_SUBVOL_SETFLAGS,
+			uintptr(unsafe.Pointer(&newFlags)))
+		if errno != 0 {
+			return fmt.Errorf("Failed to set btrfs subvolume flags for %s: %v", path, errno.Error())
+		}
+	}
+	return nil
+}
+
 func (d *Driver) updateQuotaStatus() {
 	d.once.Do(func() {
 		if !d.quotaEnabled {
@@ -870,4 +922,190 @@ func (d *Driver) Exists(id string) bool {
 	dir := d.subvolumesDirID(id)
 	_, err := os.Stat(dir)
 	return err == nil
+}
+
+type fdReader struct {
+	readFd C.int
+}
+
+func (f *fdReader) Read(p []byte) (int, error) {
+	maxReadCount := len(p)
+	if maxReadCount > 0 {
+		readCount, err := C.read(f.readFd, unsafe.Pointer(&p[0]), C.ulong(maxReadCount))
+		if int(readCount) == 0 {
+			return 0, fmt.Errorf("End-of-file for pipe")
+		} else {
+			return int(readCount), err
+		}
+	} else {
+		return 0, nil
+	}
+}
+
+// Diff produces an archive of the changes between the specified
+// layer and its parent layer which may be "".
+func (d *Driver) Diff(id, parent string) (io.ReadCloser, error) {
+	startTime := time.Now()
+
+	if parent == "" {
+		layerFs := d.subvolumesDirID(id)
+
+		archive, err := archive.Tar(layerFs, archive.Uncompressed)
+		if err != nil {
+			return nil, err
+		}
+		return ioutils.NewReadCloserWrapper(archive, func() error {
+			err := archive.Close()
+			return err
+		}), nil
+	}
+
+	changes, err := d.Changes(id, parent)
+	if err != nil {
+		return nil, err
+	}
+
+	layerFs := d.subvolumesDirID(id)
+
+	archive, err := archive.ExportChanges(layerFs, changes, d.idMap)
+	if err != nil {
+		return nil, err
+	}
+
+	return ioutils.NewReadCloserWrapper(archive, func() error {
+		err := archive.Close()
+
+		// NaiveDiffDriver compares file metadata with parent layers. Parent layers
+		// are extracted from tar's with full second precision on modified time.
+		// We need this hack here to make sure calls within same second receive
+		// correct result.
+		time.Sleep(time.Until(startTime.Truncate(time.Second).Add(time.Second)))
+		return err
+	}), nil
+}
+
+// Changes produces a list of changes between the specified layer
+// and its parent layer. If parent is "", then all changes will be ADD changes.
+func (d *Driver) Changes(id, parent string) ([]archive.Change, error) {
+	dirName := d.subvolumesDirID(id)
+	dir, err := openDir(dirName)
+	if err != nil {
+		return nil, err
+	}
+	defer closeDir(dir)
+
+	err = subvolSetPropRO(dirName, true)
+	if err != nil {
+		return nil, err
+	}
+
+	var pipe [2]C.int
+	C.pipe((*C.int)(unsafe.Pointer(&pipe)))
+
+	var cmd uintptr = C.BTRFS_IOC_SEND
+	var args C.struct_btrfs_ioctl_send_args
+	args.send_fd = (C.__s64)(pipe[1])
+	args.flags = C.BTRFS_SEND_FLAG_NO_FILE_DATA
+
+	if parent == "" {
+		args.clone_sources_count = 0
+		args.clone_sources = nil
+		args.parent_root = 0
+	} else {
+		// Get parent subvolume ID
+		parentDirPath := d.subvolumesDirID(parent)
+		parentDir, err := openDir(parentDirPath)
+		if err != nil {
+			return nil, err
+		}
+		defer closeDir(parentDir)
+
+		err = subvolSetPropRO(parentDirPath, true)
+		if err != nil {
+			return nil, err
+		}
+
+		var lkpargs C.struct_btrfs_ioctl_ino_lookup_args
+		lkpargs.objectid = C.BTRFS_FIRST_FREE_OBJECTID
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(parentDir), C.BTRFS_IOC_INO_LOOKUP,
+			uintptr(unsafe.Pointer(&lkpargs)))
+		if errno != 0 {
+			return nil, fmt.Errorf("Cannot resolve ID for path %s: %v", parentDirPath, errno.Error())
+		}
+
+		var clone_sources [1]C.__u64
+		clone_sources[0] = lkpargs.treeid
+		args.clone_sources_count = 1
+		args.clone_sources = (*C.__u64)(unsafe.Pointer(&clone_sources))
+		args.parent_root = lkpargs.treeid
+	}
+
+	go func() error {
+		defer subvolSetPropRO(dirName, false)
+		if parent != "" {
+			defer subvolSetPropRO(d.subvolumesDirID(parent), false)
+		}
+
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), cmd, uintptr(unsafe.Pointer(&args)))
+		if errno != 0 {
+			C.close(pipe[1])
+			return fmt.Errorf("Failed to get changes: %v", errno.Error())
+		}
+		r, err := C.close(pipe[1])
+		if r < 0 {
+			return err
+		} else {
+			return nil
+		}
+	}()
+
+	reader := &fdReader{
+		readFd: pipe[0],
+	}
+	changes, err := readSendStream(reader)
+	C.close(pipe[0])
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err = cleanChanges(changes)
+	if err != nil {
+		return nil, err
+	}
+
+	return changes, nil
+}
+
+// ApplyDiff extracts the changeset from the given diff into the
+// layer with the specified id and parent, returning the size of the
+// new layer in bytes.
+func (d *Driver) ApplyDiff(id, parent string, diff io.Reader) (size int64, err error) {
+	layerRootFs, err := d.Get(id, "")
+	if err != nil {
+		return 0, err
+	}
+	defer d.Put(id)
+
+	options := &archive.TarOptions{IDMap: d.idMap}
+	start := time.Now().UTC()
+	logrus.WithField("id", id).Debug("Start untar layer")
+	if size, err = chrootarchive.ApplyUncompressedLayer(layerRootFs, diff, options); err != nil {
+		return
+	}
+	logrus.WithField("id", id).Debugf("Untar time: %vs", time.Now().UTC().Sub(start).Seconds())
+
+	return
+}
+
+// DiffSize calculates the changes between the specified id
+// and its parent and returns the size in bytes of the changes
+// relative to its base filesystem directory.
+func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
+	changes, err := d.Changes(id, parent)
+	if err != nil {
+		return 0, err
+	}
+
+	dirName := d.subvolumesDirID(id)
+	return archive.ChangesSize(dirName, changes), nil
 }
